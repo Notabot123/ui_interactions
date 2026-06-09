@@ -308,7 +308,7 @@ def get_dashboard_metrics():
 
 # for checking prediction accuracy
 def update_previous_prediction_with_actual(event: InteractionEvent) -> None:
-    actual_action = event.element_id or event.event_type
+    actual_action = normalise_actual_action(event)
 
     with closing(_connect()) as conn:
         previous = conn.execute(
@@ -348,3 +348,42 @@ def update_previous_prediction_with_actual(event: InteractionEvent) -> None:
         )
 
         conn.commit()
+
+
+# normalising to assist pred vs actual
+# in future, make frontend send both element name and simplified action description
+def normalise_actual_action(event: InteractionEvent) -> str:
+    element_id = (event.element_id or "").lower()
+    element_label = (event.element_label or "").lower()
+    event_type = (event.event_type or "").lower()
+
+    text = f"{element_id} {element_label}"
+
+    if "diagram" in text:
+        return "Open Diagram"
+
+    if "inspect" in text:
+        return "Inspect Component"
+
+    if "maintenance" in text:
+        return "Maintenance History"
+
+    if "search" in text or event_type == "search":
+        return "Search Components"
+
+    if "tree-item" in element_id:
+        return "Select Component"
+
+    if "notes" in text or event_type == "input":
+        return "Edit Notes"
+
+    if "priority" in text:
+        return "Change Priority"
+
+    if "tab" in text:
+        return "Open Tab"
+
+    if event_type == "click":
+        return "Click UI Element"
+
+    return event_type.title()
