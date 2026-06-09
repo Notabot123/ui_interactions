@@ -252,59 +252,51 @@ def events_as_csv(session_id: Optional[str] = None) -> str:
         writer.writerow([row[h] for h in headers])
     return output.getvalue()
 
-
 def get_dashboard_metrics():
-    with get_connection() as conn:
-        cursor = conn.cursor()
 
-        total_events = cursor.execute(
-            "SELECT COUNT(*) FROM events"
-        ).fetchone()[0]
+    with closing(_connect()) as conn:
+        total_events = conn.execute(
+            "SELECT COUNT(*) AS c FROM interactions"
+        ).fetchone()["c"]
 
-        total_sessions = cursor.execute(
-            "SELECT COUNT(DISTINCT session_id) FROM events"
-        ).fetchone()[0]
+        total_sessions = conn.execute(
+            "SELECT COUNT(DISTINCT session_id) AS c FROM interactions"
+        ).fetchone()["c"]
 
-        total_clicks = cursor.execute(
-            "SELECT COUNT(*) FROM events WHERE event_type = 'click'"
-        ).fetchone()[0]
+        total_clicks = conn.execute(
+            "SELECT COUNT(*) AS c FROM interactions WHERE event_type = 'click'"
+        ).fetchone()["c"]
 
-        total_searches = cursor.execute(
-            "SELECT COUNT(*) FROM events WHERE event_type = 'search'"
-        ).fetchone()[0]
+        total_searches = conn.execute(
+            "SELECT COUNT(*) AS c FROM interactions WHERE event_type = 'search'"
+        ).fetchone()["c"]
 
-        total_predictions = cursor.execute(
-            "SELECT COUNT(*) FROM predictions"
-        ).fetchone()[0]
+        total_predictions = conn.execute(
+            "SELECT COUNT(*) AS c FROM predictions"
+        ).fetchone()["c"]
 
-        top_elements = cursor.execute("""
-            SELECT element_id, COUNT(*) as count
-            FROM events
+        top_elements = conn.execute("""
+            SELECT COALESCE(element_label, element_id) AS element, COUNT(*) AS count
+            FROM interactions
             WHERE element_id IS NOT NULL
-            GROUP BY element_id
+            GROUP BY COALESCE(element_label, element_id)
             ORDER BY count DESC
             LIMIT 5
         """).fetchall()
 
-        event_types = cursor.execute("""
-            SELECT event_type, COUNT(*) as count
-            FROM events
+        event_types = conn.execute("""
+            SELECT event_type, COUNT(*) AS count
+            FROM interactions
             GROUP BY event_type
             ORDER BY count DESC
         """).fetchall()
 
-        return {
-            "total_events": total_events,
-            "total_sessions": total_sessions,
-            "total_clicks": total_clicks,
-            "total_searches": total_searches,
-            "total_predictions": total_predictions,
-            "top_elements": [
-                {"element_id": row[0], "count": row[1]}
-                for row in top_elements
-            ],
-            "event_types": [
-                {"event_type": row[0], "count": row[1]}
-                for row in event_types
-            ],
-        }
+    return {
+        "total_events": total_events,
+        "total_sessions": total_sessions,
+        "total_clicks": total_clicks,
+        "total_searches": total_searches,
+        "total_predictions": total_predictions,
+        "top_elements": [dict(row) for row in top_elements],
+        "event_types": [dict(row) for row in event_types],
+    }
