@@ -327,7 +327,8 @@ def update_previous_prediction_with_actual(event: InteractionEvent) -> None:
         if not previous:
             return
 
-        is_correct = 1 if previous["action"] == actual_action else 0
+        #is_correct = 1 if previous["action"] == actual_action else 0
+        is_correct = 1 if prediction_matches_actual(previous["action"], actual_action) else 0
 
         conn.execute(
             """
@@ -356,34 +357,62 @@ def normalise_actual_action(event: InteractionEvent) -> str:
     element_id = (event.element_id or "").lower()
     element_label = (event.element_label or "").lower()
     event_type = (event.event_type or "").lower()
-
     text = f"{element_id} {element_label}"
 
-    if "diagram" in text:
+    if "search-result" in text or "search result" in text:
+        return "Open top search result"
+
+    if "tree-search" in text or "component search" in text:
+        return "Search for a component"
+
+    if "btn-open-diagram" in text or "open diagram" in text:
         return "Open Diagram"
 
-    if "inspect" in text:
+    if "btn-maintenance" in text or "maintenance" in text:
+        return "Open Maintenance History"
+
+    if "btn-inspect" in text or "inspect" in text:
         return "Inspect Component"
 
-    if "maintenance" in text:
-        return "Maintenance History"
+    if "tab-specs" in text or "specifications" in text:
+        return "View Specifications"
 
-    if "search" in text or event_type == "search":
-        return "Search Components"
+    if "tab-docs" in text or "documentation" in text:
+        return "View Documentation"
+
+    if "input-notes" in text or "notes" in text:
+        return "Add Notes"
+
+    if "select-priority" in text or "priority" in text:
+        return "Set Priority"
 
     if "tree-item" in element_id:
-        return "Select Component"
+        return "Use tree navigation"
 
-    if "notes" in text or event_type == "input":
-        return "Edit Notes"
+    if event_type == "input" and "search" in text:
+        return "Search for a component"
 
-    if "priority" in text:
-        return "Change Priority"
+    return event.element_label or event.element_id or event_type.title()
 
-    if "tab" in text:
-        return "Open Tab"
+def prediction_matches_actual(predicted: str, actual: str) -> bool:
+    predicted_l = (predicted or "").lower()
+    actual_l = (actual or "").lower()
 
-    if event_type == "click":
-        return "Click UI Element"
+    if predicted_l == actual_l:
+        return True
 
-    return event_type.title()
+    acceptable_matches = {
+        "use search result instead of expanding tree": {
+            "open top search result",
+            "search for a component",
+        },
+        "open top search result": {
+            "open top search result",
+        },
+        "use tree navigation": {
+            "use tree navigation",
+            "select component",
+        },
+    }
+
+    return actual_l in acceptable_matches.get(predicted_l, set())
