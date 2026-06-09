@@ -57,7 +57,10 @@ def init_db() -> None:
                 actual_action TEXT,
                 actual_event_type TEXT,
                 actual_element_id TEXT,
-                is_correct INTEGER
+                is_correct INTEGER,
+                matched_within_window INTEGER,
+                matched_after_events INTEGER,
+                matched_actual_action TEXT
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """
@@ -98,7 +101,9 @@ def _row_to_event(row: sqlite3.Row) -> InteractionEvent:
 
 def add_event(event: InteractionEvent) -> None:
     init_db()
-    update_previous_prediction_with_actual(event) # newly added, for predictions
+    #update_previous_prediction_with_actual(event) # newly added, for predictions
+    update_recent_predictions_with_actual(event)
+    
     with closing(_connect()) as conn:
         conn.execute(
             """
@@ -416,3 +421,67 @@ def prediction_matches_actual(predicted: str, actual: str) -> bool:
     }
 
     return actual_l in acceptable_matches.get(predicted_l, set())
+
+LOOKAHEAD_WINDOW = 5
+
+
+def update_recent_predictions_with_actual(event: InteractionEvent) -> None:
+    actual_action = normalise_actual_action(event)
+
+    with closing(_connect()) as conn:
+        recent_predictions = conn.execute(
+            """
+            SELECT id, action, timestamp
+            FROM predictions
+            WHERE session_id = ?
+              AND matched_within_window IS NULL
+              AND timestamp < ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (event.session_id, event.timestamp, LOOKAHEAD_WINDOW),
+        ).fetchall()
+
+        for offset, prediction in enumerate(recent_predictions, start=1):
+            matched = prediction_matches_actual(
+                prediction["action"],
+                actual_action,
+            )
+
+            if matched:
+                conn.execute(
+                    """
+                    UPDATE predictions
+                    SET actual_action = ?,
+                        actual_event_type = ?,
+                        actual_element_id = ?,
+                        is_correct = CASE
+                            WHEN ? = 1 THEN 1
+                            ELSE is_correct
+                        END,
+                        matched_within_window = 1,
+                        matched_after_events = ?,
+                        matched_actual_action = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        actual_action,
+                        event.event_type,
+                        event.element_id,
+                        offset,
+                        offset,
+                        actual_action,
+                        prediction["id"],
+                    ),
+                )
+            elif offset == LOOKAHEAD_WINDOW:
+                conn.execute(
+                    """
+                    UPDATE predictions
+                    SET matched_within_window = 0
+                    WHERE id = ?
+                    """,
+                    (prediction["id"],),
+                )
+
+        conn.commit()
