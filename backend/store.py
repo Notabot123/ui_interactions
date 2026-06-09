@@ -54,6 +54,10 @@ def init_db() -> None:
                 action TEXT NOT NULL,
                 confidence REAL NOT NULL,
                 reason TEXT,
+                actual_action TEXT,
+                actual_event_type TEXT,
+                actual_element_id TEXT,
+                is_correct INTEGER
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """
@@ -94,6 +98,7 @@ def _row_to_event(row: sqlite3.Row) -> InteractionEvent:
 
 def add_event(event: InteractionEvent) -> None:
     init_db()
+    update_previous_prediction_with_actual(event) # newly added, for predictions
     with closing(_connect()) as conn:
         conn.execute(
             """
@@ -300,3 +305,46 @@ def get_dashboard_metrics():
         "top_elements": [dict(row) for row in top_elements],
         "event_types": [dict(row) for row in event_types],
     }
+
+# for checking prediction accuracy
+def update_previous_prediction_with_actual(event: InteractionEvent) -> None:
+    actual_action = event.element_id or event.event_type
+
+    with closing(_connect()) as conn:
+        previous = conn.execute(
+            """
+            SELECT id, action
+            FROM predictions
+            WHERE session_id = ?
+              AND actual_action IS NULL
+              AND timestamp < ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (event.session_id, event.timestamp),
+        ).fetchone()
+
+        if not previous:
+            return
+
+        is_correct = 1 if previous["action"] == actual_action else 0
+
+        conn.execute(
+            """
+            UPDATE predictions
+            SET actual_action = ?,
+                actual_event_type = ?,
+                actual_element_id = ?,
+                is_correct = ?
+            WHERE id = ?
+            """,
+            (
+                actual_action,
+                event.event_type,
+                event.element_id,
+                is_correct,
+                previous["id"],
+            ),
+        )
+
+        conn.commit()
