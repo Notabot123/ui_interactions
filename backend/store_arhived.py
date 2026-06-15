@@ -12,29 +12,11 @@ from models import InteractionEvent, Prediction
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("INTERACTION_DB_PATH", BASE_DIR / "interaction_events.db"))
 
-# Number of future interaction events in which a prediction can still count as
-# practically useful. Strict accuracy is still measured against the immediate
-# next semantic action only.
-LOOKAHEAD_WINDOW = 5
-
 
 def _connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
-
-
-def _ensure_column(conn: sqlite3.Connection, table: str, column_name: str, column_definition: str) -> None:
-    """Add a column if it does not already exist.
-
-    SQLite does not support IF NOT EXISTS for ADD COLUMN, so check PRAGMA first.
-    This keeps existing demo databases working after git pull.
-    """
-    existing_columns = {
-        row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
-    }
-    if column_name not in existing_columns:
-        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_name} {column_definition}")
 
 
 def init_db() -> None:
@@ -78,25 +60,12 @@ def init_db() -> None:
                 is_correct INTEGER,
                 matched_within_window INTEGER,
                 matched_after_events INTEGER,
-                matched_actual_action TEXT,
+                matched_actual_action TEXT
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
-
-        # Safe migrations for existing databases. Column names are preserved for
-        # existing Grafana panels.
-        _ensure_column(conn, "predictions", "actual_action", "TEXT")
-        _ensure_column(conn, "predictions", "actual_event_type", "TEXT")
-        _ensure_column(conn, "predictions", "actual_element_id", "TEXT")
-        _ensure_column(conn, "predictions", "is_correct", "INTEGER")
-        _ensure_column(conn, "predictions", "matched_within_window", "INTEGER")
-        _ensure_column(conn, "predictions", "matched_after_events", "INTEGER")
-        _ensure_column(conn, "predictions", "matched_actual_action", "TEXT")
-        _ensure_column(conn, "predictions", "created_at", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP")
-
         conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_session ON predictions(session_id)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_timestamp ON predictions(timestamp)")
 
         conn.execute(
             """
@@ -132,8 +101,9 @@ def _row_to_event(row: sqlite3.Row) -> InteractionEvent:
 
 def add_event(event: InteractionEvent) -> None:
     init_db()
-    update_prediction_outcomes(event)
-
+    #update_previous_prediction_with_actual(event) # newly added, for predictions
+    update_recent_predictions_with_actual(event)
+    
     with closing(_connect()) as conn:
         conn.execute(
             """
@@ -292,9 +262,8 @@ def events_as_csv(session_id: Optional[str] = None) -> str:
         writer.writerow([row[h] for h in headers])
     return output.getvalue()
 
-
 def get_dashboard_metrics():
-    init_db()
+
     with closing(_connect()) as conn:
         total_events = conn.execute(
             "SELECT COUNT(*) AS c FROM interactions"
@@ -315,22 +284,6 @@ def get_dashboard_metrics():
         total_predictions = conn.execute(
             "SELECT COUNT(*) AS c FROM predictions"
         ).fetchone()["c"]
-
-        strict_accuracy = conn.execute(
-            """
-            SELECT ROUND(AVG(is_correct) * 100, 1) AS value
-            FROM predictions
-            WHERE is_correct IS NOT NULL
-            """
-        ).fetchone()["value"]
-
-        windowed_accuracy = conn.execute(
-            """
-            SELECT ROUND(AVG(matched_within_window) * 100, 1) AS value
-            FROM predictions
-            WHERE matched_within_window IS NOT NULL
-            """
-        ).fetchone()["value"]
 
         top_elements = conn.execute("""
             SELECT COALESCE(element_label, element_id) AS element, COUNT(*) AS count
@@ -354,15 +307,57 @@ def get_dashboard_metrics():
         "total_clicks": total_clicks,
         "total_searches": total_searches,
         "total_predictions": total_predictions,
-        "strict_accuracy_pct": strict_accuracy or 0,
-        "windowed_accuracy_pct": windowed_accuracy or 0,
         "top_elements": [dict(row) for row in top_elements],
         "event_types": [dict(row) for row in event_types],
     }
 
+# for checking prediction accuracy
+def update_previous_prediction_with_actual(event: InteractionEvent) -> None:
+    actual_action = normalise_actual_action(event)
 
-# Normalising to assist predicted-vs-actual evaluation.
-# Future improvement: have the frontend send both raw element_id and semantic_action.
+    with closing(_connect()) as conn:
+        previous = conn.execute(
+            """
+            SELECT id, action
+            FROM predictions
+            WHERE session_id = ?
+              AND actual_action IS NULL
+              AND timestamp < ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (event.session_id, event.timestamp),
+        ).fetchone()
+
+        if not previous:
+            return
+
+        #is_correct = 1 if previous["action"] == actual_action else 0
+        is_correct = 1 if prediction_matches_actual(previous["action"], actual_action) else 0
+
+        conn.execute(
+            """
+            UPDATE predictions
+            SET actual_action = ?,
+                actual_event_type = ?,
+                actual_element_id = ?,
+                is_correct = ?
+            WHERE id = ?
+            """,
+            (
+                actual_action,
+                event.event_type,
+                event.element_id,
+                is_correct,
+                previous["id"],
+            ),
+        )
+
+        conn.commit()
+
+
+# normalising to assist pred vs actual
+# in future, make frontend send both element name and simplified action description
 def normalise_actual_action(event: InteractionEvent) -> str:
     element_id = (event.element_id or "").lower()
     element_label = (event.element_label or "").lower()
@@ -404,7 +399,6 @@ def normalise_actual_action(event: InteractionEvent) -> str:
 
     return event.element_label or event.element_id or event_type.title()
 
-
 def prediction_matches_actual(predicted: str, actual: str) -> bool:
     predicted_l = (predicted or "").lower()
     actual_l = (actual or "").lower()
@@ -428,110 +422,59 @@ def prediction_matches_actual(predicted: str, actual: str) -> bool:
 
     return actual_l in acceptable_matches.get(predicted_l, set())
 
-
-def _events_after_prediction(conn: sqlite3.Connection, prediction_timestamp: float, event: InteractionEvent) -> int:
-    """Count how many interaction events after a prediction this event represents.
-
-    add_event() calls update_prediction_outcomes() before inserting the current
-    event, so we count existing later interactions and add 1 for the current one.
-    """
-    prior_later_events = conn.execute(
-        """
-        SELECT COUNT(*) AS c
-        FROM interactions
-        WHERE session_id = ?
-          AND timestamp > ?
-          AND timestamp < ?
-        """,
-        (event.session_id, prediction_timestamp, event.timestamp),
-    ).fetchone()["c"]
-    return prior_later_events + 1
+LOOKAHEAD_WINDOW = 5
 
 
-def update_prediction_outcomes(event: InteractionEvent) -> None:
-    """Evaluate strict and windowed prediction outcomes for a new interaction.
-
-    Columns populated:
-    - actual_action / actual_event_type / actual_element_id: the immediate next
-      semantic action after a prediction. This powers strict accuracy.
-    - is_correct: 1 only when the immediate next semantic action matched.
-    - matched_within_window: 1 if the predicted action appears within the next
-      LOOKAHEAD_WINDOW events, otherwise 0 once the window expires.
-    - matched_after_events / matched_actual_action: how far ahead the practical
-      match occurred.
-    """
+def update_recent_predictions_with_actual(event: InteractionEvent) -> None:
     actual_action = normalise_actual_action(event)
 
     with closing(_connect()) as conn:
-        candidate_predictions = conn.execute(
+        recent_predictions = conn.execute(
             """
-            SELECT id, action, timestamp, actual_action, is_correct, matched_within_window
+            SELECT id, action, timestamp
             FROM predictions
             WHERE session_id = ?
+              AND matched_within_window IS NULL
               AND timestamp < ?
-              AND (is_correct IS NULL OR matched_within_window IS NULL)
             ORDER BY timestamp DESC
-            LIMIT 50
+            LIMIT ?
             """,
-            (event.session_id, event.timestamp),
+            (event.session_id, event.timestamp, LOOKAHEAD_WINDOW),
         ).fetchall()
 
-        for prediction in candidate_predictions:
-            events_after = _events_after_prediction(conn, prediction["timestamp"], event)
+        for offset, prediction in enumerate(recent_predictions, start=1):
+            matched = prediction_matches_actual(
+                prediction["action"],
+                actual_action,
+            )
 
-            # Ignore very old predictions that should already have expired. If a
-            # previous run left them unresolved, expire them defensively.
-            if events_after > LOOKAHEAD_WINDOW:
-                if prediction["matched_within_window"] is None:
-                    conn.execute(
-                        """
-                        UPDATE predictions
-                        SET matched_within_window = 0
-                        WHERE id = ?
-                        """,
-                        (prediction["id"],),
-                    )
-                continue
-
-            matched = prediction_matches_actual(prediction["action"], actual_action)
-
-            # Strict next-action evaluation: only the first event after the
-            # prediction can populate actual_action/is_correct.
-            if events_after == 1 and prediction["is_correct"] is None:
-                strict_correct = 1 if matched else 0
+            if matched:
                 conn.execute(
                     """
                     UPDATE predictions
                     SET actual_action = ?,
                         actual_event_type = ?,
                         actual_element_id = ?,
-                        is_correct = ?
+                        is_correct = CASE
+                            WHEN ? = 1 THEN 1
+                            ELSE is_correct
+                        END,
+                        matched_within_window = 1,
+                        matched_after_events = ?,
+                        matched_actual_action = ?
                     WHERE id = ?
                     """,
                     (
                         actual_action,
                         event.event_type,
                         event.element_id,
-                        strict_correct,
+                        offset,
+                        offset,
+                        actual_action,
                         prediction["id"],
                     ),
                 )
-
-            # Windowed evaluation: any match within the look-ahead window counts.
-            if matched and prediction["matched_within_window"] is None:
-                conn.execute(
-                    """
-                    UPDATE predictions
-                    SET matched_within_window = 1,
-                        matched_after_events = ?,
-                        matched_actual_action = ?
-                    WHERE id = ?
-                    """,
-                    (events_after, actual_action, prediction["id"]),
-                )
-
-            # If this is the last allowed event and there was no match, expire it.
-            if events_after >= LOOKAHEAD_WINDOW and not matched and prediction["matched_within_window"] is None:
+            elif offset == LOOKAHEAD_WINDOW:
                 conn.execute(
                     """
                     UPDATE predictions
